@@ -67,6 +67,7 @@ interface SidebarProps {
   deleteProfile: (id: string) => void;
   cloneActiveProfile: () => void;
   onConnect: () => void;
+  onCancelConnect: () => void;
   onDisconnect: () => void;
   logLevel: LoggingLevel;
   sendLogLevelRequest: (level: LoggingLevel) => void;
@@ -90,6 +91,7 @@ const Sidebar = ({
   deleteProfile,
   cloneActiveProfile,
   onConnect,
+  onCancelConnect,
   onDisconnect,
   logLevel,
   sendLogLevelRequest,
@@ -143,6 +145,7 @@ const Sidebar = ({
   const [copiedServerEntry, setCopiedServerEntry] = useState(false);
   const [copiedServerFile, setCopiedServerFile] = useState(false);
   const { toast } = useToast();
+  const isConnecting = connectionStatus === "connecting";
 
   const connectionTypeTip =
     "Connect to server directly (requires CORS config on server) or via the proxy";
@@ -775,18 +778,31 @@ const Sidebar = ({
               </div>
             )}
             {connectionStatus !== "connected" && (
-              <Button className="w-full" onClick={onConnect}>
-                <Play className="w-4 h-4 mr-2" />
-                Connect
+              <Button
+                className="w-full"
+                onClick={isConnecting ? onCancelConnect : onConnect}
+                variant={isConnecting ? "outline" : "default"}
+              >
+                {isConnecting ? (
+                  <RefreshCwOff className="w-4 h-4 mr-2" />
+                ) : (
+                  <Play className="w-4 h-4 mr-2" />
+                )}
+                {isConnecting ? "Cancel" : "Connect"}
               </Button>
             )}
 
-            <div className="flex items-center justify-center space-x-2 mb-4">
+            <div
+              className="flex items-center justify-center space-x-2 mb-4"
+              aria-live="polite"
+            >
               <div
                 className={`w-2 h-2 rounded-full ${(() => {
                   switch (connectionStatus) {
                     case "connected":
                       return "bg-green-500";
+                    case "connecting":
+                      return "bg-green-500 animate-pulse";
                     case "error":
                       return "bg-red-500";
                     case "error-connecting-to-proxy":
@@ -796,17 +812,23 @@ const Sidebar = ({
                   }
                 })()}`}
               />
-              <span className="text-sm text-gray-600 dark:text-gray-400">
+              <span
+                className={`text-sm ${isConnecting ? "font-medium text-green-600 dark:text-green-400" : "text-gray-600 dark:text-gray-400"}`}
+              >
                 {(() => {
                   switch (connectionStatus) {
                     case "connected":
                       return "Connected";
+                    case "connecting":
+                      return "正在连接 MCP Server，请稍候...";
                     case "error": {
                       const hasProxyToken = config.MCP_PROXY_AUTH_TOKEN?.value;
-                      if (!hasProxyToken) {
+                      if (connectionType === "proxy" && !hasProxyToken) {
                         return "Connection Error - Did you add the proxy session token in Configuration?";
                       }
-                      return "Connection Error - Check if your MCP server is running and proxy token is correct";
+                      return connectionType === "proxy"
+                        ? "Connection Error - Check if your MCP server is running and proxy token is correct"
+                        : "Connection Error - Check if your MCP server is running and URL/transport are correct";
                     }
                     case "error-connecting-to-proxy":
                       return "Error Connecting to Proxy - Check Console logs";

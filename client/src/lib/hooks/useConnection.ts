@@ -29,7 +29,7 @@ import type {
   SchemaOutput,
 } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useToast } from "@/lib/hooks/useToast";
 import { ConnectionStatus, CLIENT_IDENTITY } from "../constants";
 import { isConnectionAuthError } from "../connectionAuthErrors";
@@ -119,6 +119,159 @@ export function useConnection({
     useState<Implementation | null>(null);
   const [connectionDiagnostic, setConnectionDiagnostic] =
     useState<ConnectionDiagnostic | null>(null);
+  const connectionAbortControllerRef = useRef<AbortController | null>(null);
+  const connectingTransportRef = useRef<Transport | null>(null);
+  const connectingClientRef = useRef<Client<
+    Request,
+    Notification,
+    Result
+  > | null>(null);
+  const connectAttemptRef = useRef(0);
+
+  const closeQuietly = (target: { close: () => void | Promise<void> }) => {
+    Promise.resolve(target.close()).catch((error) => {
+      console.warn("Failed to close pending MCP connection", error);
+    });
+  };
+
+  const cancelConnectAttempt = ({
+    resetStatus = true,
+  }: { resetStatus?: boolean } = {}) => {
+    const abortController = connectionAbortControllerRef.current;
+    const connectingTransport = connectingTransportRef.current;
+    const connectingClient = connectingClientRef.current;
+
+    if (abortController || connectingTransport || connectingClient) {
+      connectAttemptRef.current += 1;
+    }
+
+    connectionAbortControllerRef.current = null;
+    connectingTransportRef.current = null;
+    connectingClientRef.current = null;
+
+    abortController?.abort();
+    if (connectingClient) closeQuietly(connectingClient);
+    if (connectingTransport) closeQuietly(connectingTransport);
+
+    if (resetStatus) {
+      setConnectionStatus("disconnected");
+      setConnectionDiagnostic(null);
+      setServerCapabilities(null);
+      setServerImplementation(null);
+    }
+  };
+
+  const clearActiveConnectAttempt = (
+    abortController: AbortController,
+    attemptId: number,
+  ) => {
+    if (
+      connectionAbortControllerRef.current === abortController &&
+      connectAttemptRef.current === attemptId
+    ) {
+      connectionAbortControllerRef.current = null;
+      connectingTransportRef.current = null;
+      connectingClientRef.current = null;
+    }
+  };
+
+  const isActiveConnectAttempt = (
+    abortController: AbortController,
+    attemptId: number,
+  ) =>
+    connectionAbortControllerRef.current === abortController &&
+    connectAttemptRef.current === attemptId &&
+    !abortController.signal.aborted;
+
+  const mergeAbortSignals = (
+    ...signals: Array<AbortSignal | null | undefined>
+  ): AbortSignal | undefined => {
+    const activeSignals = signals.filter((signal): signal is AbortSignal =>
+      Boolean(signal),
+    );
+    if (activeSignals.length === 0) return undefined;
+    if (activeSignals.length === 1) return activeSignals[0];
+
+    const abortController = new AbortController();
+    const abort = () => abortController.abort();
+
+    for (const signal of activeSignals) {
+      if (signal.aborted) {
+        abort();
+        break;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+    }
+
+    return abortController.signal;
+  };
+
+  const withConnectionAbort = (
+    init: RequestInit | undefined,
+    signal: AbortSignal,
+  ): RequestInit => ({
+    ...init,
+    signal: mergeAbortSignals(init?.signal, signal),
+  });
+
+  const normalizeRequestHeaders = (
+    headers?: HeadersInit,
+  ): Record<string, string> => {
+    const normalizedHeaders: Record<string, string> = {};
+    const canonicalHeaderName = (name: string) => {
+      const headerName = name.trim();
+      switch (headerName.toLowerCase()) {
+        case "authorization":
+          return "Authorization";
+        case "accept":
+          return "Accept";
+        case "content-type":
+          return "content-type";
+        default:
+          return headerName;
+      }
+    };
+    const setHeader = (name: string, value: string) => {
+      const headerName = canonicalHeaderName(name);
+      if (!headerName) return;
+      const existingHeaderName = Object.keys(normalizedHeaders).find(
+        (key) => key.toLowerCase() === headerName.toLowerCase(),
+      );
+      if (existingHeaderName) {
+        delete normalizedHeaders[existingHeaderName];
+      }
+      normalizedHeaders[headerName] = value;
+    };
+
+    if (!headers) return normalizedHeaders;
+    if (headers instanceof Headers) {
+      headers.forEach((value, name) => setHeader(name, value));
+      return normalizedHeaders;
+    }
+    if (Array.isArray(headers)) {
+      headers.forEach(([name, value]) => setHeader(name, value));
+      return normalizedHeaders;
+    }
+
+    Object.entries(headers).forEach(([name, value]) => {
+      setHeader(name, value);
+    });
+    return normalizedHeaders;
+  };
+
+  const mergeRequestHeaders = (
+    ...headersList: Array<HeadersInit | undefined>
+  ): Record<string, string> =>
+    headersList.reduce<Record<string, string>>(
+      (mergedHeaders, currentHeaders) => ({
+        ...mergedHeaders,
+        ...normalizeRequestHeaders(currentHeaders),
+      }),
+      {},
+    );
+
+  const isAbortError = (error: unknown) =>
+    error instanceof Error && error.name === "AbortError";
 
   useEffect(() => {
     if (!oauthClientId) {
@@ -263,11 +416,12 @@ export function useConnection({
       serverUrl: sseUrl,
     });
 
-  const checkProxyHealth = async () => {
+  const checkProxyHealth = async (signal: AbortSignal) => {
     try {
       const proxyHealthUrl = new URL(`${getMCPProxyAddress(config)}/health`);
       const proxyHealthResponse = await fetch(proxyHealthUrl, {
         headers: getProxyAuthHeaders(),
+        signal,
       });
       const proxyHealth = await proxyHealthResponse.json();
       if (proxyHealth?.status !== "ok") {
@@ -279,14 +433,25 @@ export function useConnection({
     }
   };
 
-  const ensureProxyAuthentication = async (): Promise<boolean> => {
+  const ensureProxyAuthentication = async (
+    signal: AbortSignal,
+  ): Promise<boolean> => {
     const proxyConfigUrl = new URL(`${getMCPProxyAddress(config)}/config`);
     const response = await fetch(proxyConfigUrl, {
       headers: getProxyAuthHeaders(),
+      signal,
     });
+
+    if (signal.aborted) {
+      return false;
+    }
 
     if (response.status !== 401) {
       return true;
+    }
+
+    if (signal.aborted) {
+      return false;
     }
 
     setConnectionDiagnostic(
@@ -367,9 +532,73 @@ export function useConnection({
   };
 
   const connect = async (_e?: unknown, retryCount: number = 0) => {
-    if (retryCount === 0) {
-      setConnectionDiagnostic(null);
+    const isRetry = retryCount > 0;
+    const abortController = isRetry
+      ? connectionAbortControllerRef.current
+      : new AbortController();
+
+    if (!abortController) {
+      return;
     }
+
+    const attemptId = isRetry
+      ? connectAttemptRef.current
+      : connectAttemptRef.current + 1;
+
+    if (!isRetry) {
+      cancelConnectAttempt({ resetStatus: false });
+      connectAttemptRef.current = attemptId;
+      connectionAbortControllerRef.current = abortController;
+      connectingTransportRef.current = null;
+      connectingClientRef.current = null;
+      setConnectionStatus("connecting");
+      setConnectionDiagnostic(null);
+      setServerCapabilities(null);
+      setServerImplementation(null);
+    }
+
+    const abortSignal = abortController.signal;
+    let hasUserAuthorizationHeader = false;
+    let hasOAuthContext = Boolean(
+      oauthClientId?.trim() || oauthClientSecret?.trim() || oauthScope?.trim(),
+    );
+    const hasOAuthChallenge = (response: Response) => {
+      const wwwAuthenticate = response.headers.get("www-authenticate");
+      if (!wwwAuthenticate) return false;
+
+      const challenge = wwwAuthenticate.toLowerCase();
+      return (
+        challenge.includes("bearer") &&
+        (challenge.includes("resource_metadata") ||
+          challenge.includes("authorization_uri"))
+      );
+    };
+    const shouldStopAfterUnauthorized = (response: Response) => {
+      if (response.status !== 401) return false;
+      if (hasUserAuthorizationHeader) return true;
+      return !hasOAuthContext && !hasOAuthChallenge(response);
+    };
+    const fetchWithConnectionAbort = async (
+      url: string | URL | globalThis.Request,
+      init?: RequestInit,
+    ) => {
+      const response = await fetch(url, withConnectionAbort(init, abortSignal));
+      if (shouldStopAfterUnauthorized(response)) {
+        await response.body?.cancel();
+        throw new Error(`HTTP 401: Unauthorized at ${String(url)}`);
+      }
+      return response;
+    };
+    const fetchWithResponseHeaderCapture = async (
+      url: string | URL | globalThis.Request,
+      init?: RequestInit,
+    ) => {
+      const response = await fetchWithConnectionAbort(url, init);
+      if (isActiveConnectAttempt(abortController, attemptId)) {
+        captureResponseHeaders(response);
+      }
+      return response;
+    };
 
     // 仅声明 tools 调试所需的最小客户端能力。
     const clientCapabilities = {
@@ -380,18 +609,31 @@ export function useConnection({
       CLIENT_IDENTITY,
       clientCapabilities,
     );
+    connectingClientRef.current = client;
+
+    if (!isActiveConnectAttempt(abortController, attemptId)) return;
 
     // Only check proxy health for proxy connections
     if (connectionType === "proxy") {
       try {
-        await checkProxyHealth();
-        const proxyAuthReady = await ensureProxyAuthentication();
+        await checkProxyHealth(abortSignal);
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
+
+        const proxyAuthReady = await ensureProxyAuthentication(abortSignal);
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
         if (!proxyAuthReady) {
+          clearActiveConnectAttempt(abortController, attemptId);
           return;
         }
       } catch (error) {
+        if (abortSignal.aborted || isAbortError(error)) {
+          clearActiveConnectAttempt(abortController, attemptId);
+          return;
+        }
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
         setConnectionDiagnostic(buildConnectionDiagnostic(error));
         setConnectionStatus("error-connecting-to-proxy");
+        clearActiveConnectAttempt(abortController, attemptId);
         return;
       }
     }
@@ -417,6 +659,12 @@ export function useConnection({
         (header) => header.enabled && isEmptyAuthHeader(header),
       );
 
+      hasUserAuthorizationHeader = finalHeaders.some(
+        (header) =>
+          header.enabled &&
+          header.name.trim().toLowerCase() === "authorization",
+      );
+
       if (hasEmptyAuthHeader) {
         toast({
           title: "Invalid Authorization Header",
@@ -426,15 +674,13 @@ export function useConnection({
         });
       }
 
-      const needsOAuthToken = !finalHeaders.some(
-        (header) =>
-          header.enabled &&
-          header.name.trim().toLowerCase() === "authorization",
-      );
+      const needsOAuthToken = !hasUserAuthorizationHeader;
 
       if (needsOAuthToken) {
         const oauthToken = (await serverAuthProvider.tokens())?.access_token;
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
         if (oauthToken) {
+          hasOAuthContext = true;
           // Add the OAuth token
           finalHeaders = [
             // Remove any existing Authorization headers with empty tokens
@@ -481,31 +727,20 @@ export function useConnection({
         // Direct connection - use the provided URL directly (not available for STDIO)
         serverUrl = new URL(sseUrl);
 
-        const requestHeaders = { ...headers };
-        if (mcpSessionId) {
-          requestHeaders["mcp-session-id"] = mcpSessionId;
-        }
+        const requestHeaders = mergeRequestHeaders(
+          headers,
+          mcpSessionId ? { "mcp-session-id": mcpSessionId } : undefined,
+        );
         switch (transportType) {
           case "sse":
             requestHeaders["Accept"] = "text/event-stream";
             requestHeaders["content-type"] = "application/json";
             transportOptions = {
               authProvider: serverAuthProvider,
-              fetch: async (
-                url: string | URL | globalThis.Request,
-                init?: RequestInit,
-              ) => {
-                const response = await fetch(url, {
-                  ...init,
-                  headers: requestHeaders,
-                });
-
-                // Capture protocol-related headers from response
-                captureResponseHeaders(response);
-                return response;
-              },
+              fetch: fetchWithResponseHeaderCapture,
               requestInit: {
                 headers: requestHeaders,
+                signal: abortSignal,
               },
             };
             break;
@@ -513,25 +748,10 @@ export function useConnection({
           case "streamable-http":
             transportOptions = {
               authProvider: serverAuthProvider,
-              fetch: async (
-                url: string | URL | globalThis.Request,
-                init?: RequestInit,
-              ) => {
-                requestHeaders["Accept"] =
-                  "text/event-stream, application/json";
-                requestHeaders["Content-Type"] = "application/json";
-                const response = await fetch(url, {
-                  headers: requestHeaders,
-                  ...init,
-                });
-
-                // Capture protocol-related headers from response
-                captureResponseHeaders(response);
-
-                return response;
-              },
+              fetch: fetchWithResponseHeaderCapture,
               requestInit: {
                 headers: requestHeaders,
+                signal: abortSignal,
               },
               // TODO these should be configurable...
               reconnectionOptions: {
@@ -567,17 +787,11 @@ export function useConnection({
             transportOptions = {
               authProvider: serverAuthProvider,
               eventSourceInit: {
-                fetch: (
-                  url: string | URL | globalThis.Request,
-                  init?: RequestInit,
-                ) =>
-                  fetch(url, {
-                    ...init,
-                    headers: { ...headers, ...proxyHeaders },
-                  }),
+                fetch: fetchWithConnectionAbort,
               },
               requestInit: {
-                headers: { ...headers, ...proxyHeaders },
+                headers: mergeRequestHeaders(headers, proxyHeaders),
+                signal: abortSignal,
               },
             };
             break;
@@ -598,17 +812,11 @@ export function useConnection({
             transportOptions = {
               authProvider: serverAuthProvider,
               eventSourceInit: {
-                fetch: (
-                  url: string | URL | globalThis.Request,
-                  init?: RequestInit,
-                ) =>
-                  fetch(url, {
-                    ...init,
-                    headers: { ...headers, ...proxyHeaders },
-                  }),
+                fetch: fetchWithConnectionAbort,
               },
               requestInit: {
-                headers: { ...headers, ...proxyHeaders },
+                headers: mergeRequestHeaders(headers, proxyHeaders),
+                signal: abortSignal,
               },
             };
             break;
@@ -619,18 +827,10 @@ export function useConnection({
             mcpProxyServerUrl.searchParams.append("url", sseUrl);
             transportOptions = {
               authProvider: serverAuthProvider,
-              eventSourceInit: {
-                fetch: (
-                  url: string | URL | globalThis.Request,
-                  init?: RequestInit,
-                ) =>
-                  fetch(url, {
-                    ...init,
-                    headers: { ...headers, ...proxyHeaders },
-                  }),
-              },
+              fetch: fetchWithConnectionAbort,
               requestInit: {
-                headers: { ...headers, ...proxyHeaders },
+                headers: mergeRequestHeaders(headers, proxyHeaders),
+                signal: abortSignal,
               },
               // TODO these should be configurable...
               reconnectionOptions: {
@@ -645,6 +845,8 @@ export function useConnection({
         serverUrl = mcpProxyServerUrl as URL;
         serverUrl.searchParams.append("transportType", transportType);
       }
+
+      if (!isActiveConnectAttempt(abortController, attemptId)) return;
 
       if (onNotification) {
         [
@@ -666,9 +868,10 @@ export function useConnection({
         };
       }
 
-      let capabilities;
+      let capabilities: ServerCapabilities | undefined;
+      let transport: Transport | null = null;
       try {
-        const transport =
+        transport =
           transportType === "streamable-http"
             ? new StreamableHTTPClientTransport(serverUrl, {
                 sessionId: undefined,
@@ -676,7 +879,11 @@ export function useConnection({
               })
             : new SSEClientTransport(serverUrl, transportOptions);
 
-        await client.connect(transport as Transport);
+        connectingTransportRef.current = transport;
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
+
+        await client.connect(transport);
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
 
         const protocolOnMessage = transport.onmessage;
         if (protocolOnMessage) {
@@ -707,6 +914,16 @@ export function useConnection({
           error,
         );
 
+        if (
+          abortSignal.aborted ||
+          isAbortError(error) ||
+          !isActiveConnectAttempt(abortController, attemptId)
+        ) {
+          if (transport) closeQuietly(transport);
+          clearActiveConnectAttempt(abortController, attemptId);
+          return;
+        }
+
         // Check if it's a proxy auth error
         if (isProxyAuthError(error)) {
           const diagnostic = buildConnectionDiagnostic(error);
@@ -717,25 +934,31 @@ export function useConnection({
             variant: "destructive",
           });
           setConnectionStatus("error");
+          clearActiveConnectAttempt(abortController, attemptId);
           return;
         }
 
         const shouldRetry = await handleAuthError(error);
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
         if (shouldRetry) {
           return connect(undefined, retryCount + 1);
         }
         if (isConnectionAuthError(error)) {
-          // Don't set error state if we're about to redirect for auth
-
+          // OAuth can redirect the page. If it does not, leave the UI in a safe idle state.
+          setConnectionStatus("disconnected");
+          clearActiveConnectAttempt(abortController, attemptId);
           return;
         }
         throw error;
       }
+
+      if (!isActiveConnectAttempt(abortController, attemptId)) return;
       setServerCapabilities(capabilities ?? null);
 
       if (capabilities?.logging && defaultLoggingLevel) {
         lastRequest = "logging/setLevel";
         await client.setLoggingLevel(defaultLoggingLevel);
+        if (!isActiveConnectAttempt(abortController, attemptId)) return;
         pushHistory(
           {
             method: "logging/setLevel",
@@ -748,10 +971,21 @@ export function useConnection({
         lastRequest = "";
       }
 
+      if (!isActiveConnectAttempt(abortController, attemptId)) return;
       setMcpClient(client);
       setConnectionDiagnostic(null);
       setConnectionStatus("connected");
+      clearActiveConnectAttempt(abortController, attemptId);
     } catch (e) {
+      if (
+        abortSignal.aborted ||
+        isAbortError(e) ||
+        !isActiveConnectAttempt(abortController, attemptId)
+      ) {
+        clearActiveConnectAttempt(abortController, attemptId);
+        return;
+      }
+
       if (
         lastRequest === "logging/setLevel" &&
         e instanceof McpError &&
@@ -773,14 +1007,18 @@ export function useConnection({
       }
       console.error(e);
       setConnectionStatus("error");
+      clearActiveConnectAttempt(abortController, attemptId);
     }
   };
 
   const disconnect = async () => {
-    if (transportType === "streamable-http")
+    cancelConnectAttempt({ resetStatus: false });
+
+    if (transportType === "streamable-http" && clientTransport) {
       await (
         clientTransport as StreamableHTTPClientTransport
       ).terminateSession();
+    }
     await mcpClient?.close();
     const authProvider = new InspectorOAuthClientProvider(sseUrl);
     authProvider.clear();
@@ -789,6 +1027,7 @@ export function useConnection({
     setConnectionStatus("disconnected");
     setConnectionDiagnostic(null);
     setServerCapabilities(null);
+    setServerImplementation(null);
     setMcpSessionId(null);
     setMcpProtocolVersion(null);
   };
@@ -802,6 +1041,7 @@ export function useConnection({
     requestHistory,
     makeRequest,
     connect,
+    cancelConnectAttempt,
     disconnect,
   };
 }

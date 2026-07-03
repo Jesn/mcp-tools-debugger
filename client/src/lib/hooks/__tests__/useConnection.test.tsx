@@ -527,12 +527,13 @@ describe("useConnection", () => {
       );
       expect(mockSSETransport?.options?.eventSourceInit?.fetch).toBeDefined();
 
-      // Verify the fetch function includes the proxy auth header
+      // Verify the fetch function preserves the SDK-provided request init.
       const mockFetch = mockSSETransport.options?.eventSourceInit?.fetch;
       const testUrl = "http://test.com";
       await mockFetch?.(testUrl, {
         headers: {
           Accept: "text/event-stream",
+          "X-MCP-Proxy-Auth": "Bearer test-proxy-token",
         },
         cache: "no-store",
         mode: "cors",
@@ -822,6 +823,50 @@ describe("useConnection", () => {
       expect(
         mockStreamableHTTPTransport.options?.requestInit?.headers,
       ).toHaveProperty("X-MCP-Proxy-Auth", "Bearer test-proxy-token");
+    });
+
+    test("stops streamable-http after a plain 401 when Authorization is user-managed", async () => {
+      const fetchMock = global.fetch as jest.Mock;
+      const cancelBody = jest.fn();
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValueOnce({
+        status: 401,
+        headers: {
+          get: jest.fn().mockReturnValue(null),
+        },
+        body: {
+          cancel: cancelBody,
+        },
+      });
+
+      const { result } = renderHook(() =>
+        useConnection({
+          ...defaultProps,
+          connectionType: "direct",
+          transportType: "streamable-http",
+          customHeaders: [
+            {
+              name: "Authorization",
+              value: "Bearer invalid-token",
+              enabled: true,
+            },
+          ],
+        }),
+      );
+
+      await act(async () => {
+        await result.current.connect();
+      });
+
+      const fetchFn = (
+        mockStreamableHTTPTransport.options as { fetch?: typeof fetch }
+      ).fetch;
+      expect(fetchFn).toBeDefined();
+      await expect(fetchFn!("http://127.0.0.1:3302/mcp", {})).rejects.toThrow(
+        "HTTP 401: Unauthorized",
+      );
+      expect(cancelBody).toHaveBeenCalled();
+      expect(mockAuth).not.toHaveBeenCalled();
     });
   });
 

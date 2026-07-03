@@ -49,6 +49,21 @@ import { InspectorConfig } from "./lib/configurationTypes";
 import { initializeInspectorConfig } from "./utils/configUtils";
 
 const CONFIG_LOCAL_STORAGE_KEY = "inspectorConfig_v1";
+const LEGACY_CONNECTION_STATUS_KEY_PREFIX = "mcp-connection-status-";
+
+const collectLegacyConnectionStatusKeys = (storage: Storage) =>
+  Array.from({ length: storage.length }, (_, index) =>
+    storage.key(index),
+  ).filter(
+    (key): key is string =>
+      key?.startsWith(LEGACY_CONNECTION_STATUS_KEY_PREFIX) ?? false,
+  );
+
+const clearLegacyConnectionStatusFlags = (storage: Storage) => {
+  for (const key of collectLegacyConnectionStatusKeys(storage)) {
+    storage.removeItem(key);
+  }
+};
 
 const App = () => {
   // ---- Connection profile（聚合实体，取代原本散落的 14 个 useState）----
@@ -117,6 +132,7 @@ const App = () => {
     serverImplementation,
     mcpClient,
     connect: connectMcpServer,
+    cancelConnectAttempt,
     disconnect: disconnectMcpServer,
     makeRequest,
   } = useConnection({
@@ -137,34 +153,13 @@ const App = () => {
     defaultLoggingLevel: logLevel,
   });
 
-  // 自动重连：仅在初始挂载（F5 刷新）时读取上次连接状态触发一次
-  // 注意：StrictMode 下 effect 会双触发，ref 守卫保证 connect 只调用一次；
-  // 不使用 setTimeout + cleanup，避免 StrictMode 在 cleanup 阶段清除定时器
-  const autoReconnectAttemptedRef = useRef(false);
   useEffect(() => {
-    if (autoReconnectAttemptedRef.current) return;
-    const key = `mcp-connection-status-${activeProfile.id}`;
-    if (localStorage.getItem(key) !== "true") return;
-    autoReconnectAttemptedRef.current = true;
-    console.info("[MCP Inspector] 检测到上次连接状态，自动重连...");
-    void connectMcpServer();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    clearLegacyConnectionStatusFlags(localStorage);
   }, []);
 
-  // 仅在成功连接后写入标志；用户主动断开时由 handleDisconnect 清除
-  useEffect(() => {
-    if (connectionStatus === "connected") {
-      const key = `mcp-connection-status-${activeProfile.id}`;
-      localStorage.setItem(key, "true");
-    }
-  }, [connectionStatus, activeProfile.id]);
-
   const handleManualDisconnect = useCallback(async () => {
-    const key = `mcp-connection-status-${activeProfile.id}`;
-    localStorage.removeItem(key);
-    autoReconnectAttemptedRef.current = true;
     await disconnectMcpServer();
-  }, [activeProfile.id, disconnectMcpServer]);
+  }, [disconnectMcpServer]);
 
   const sendMCPRequest = async <T extends AnySchema>(
     request: ClientRequest,
@@ -464,6 +459,7 @@ const App = () => {
               connectionStatus={connectionStatus}
               connectionDiagnostic={connectionDiagnostic}
               onConnect={connectMcpServer}
+              onCancelConnect={cancelConnectAttempt}
               onDisconnect={handleManualDisconnect}
               logLevel={logLevel}
               sendLogLevelRequest={sendLogLevelRequest}
